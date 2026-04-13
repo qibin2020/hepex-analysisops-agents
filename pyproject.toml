@@ -16,6 +16,10 @@ dependencies = [
     "vector>=1.7.0",
     "ipykernel>=7.1.0",
     "atlasopenmagic>=1.8.0",
+    "matplotlib>=3.10.8",
+    "mplhep>=1.1.2",
+    "pyyaml>=6.0.3",
+    "tqdm>=4.67.1",
 ]
 
 [project.optional-dependencies]
