@@ -13,7 +13,7 @@ from a2a.utils import (
     new_task,
 )
 
-from agent import WhiteAgent as Agent
+from agent import PurpleAgent as Agent
 
 
 TERMINAL_STATES = {

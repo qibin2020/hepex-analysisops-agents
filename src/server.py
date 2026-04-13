@@ -46,7 +46,7 @@ def main():
     )
 
     agent_card = AgentCard(
-        name="HEPEx White Agent",
+        name="HEPEx Purple Agent",
         description="A physics analysis agent that can inspect ROOT files, load kinematics, compute invariant masses, and perform peak fits.",
         url=args.card_url or f"http://{args.host}:{args.port}/",
         version='1.0.0',

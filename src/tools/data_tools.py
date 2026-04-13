@@ -2,12 +2,13 @@
 Data download tools for ATLAS Open Data.
 Ported from hepex-analysisops-benchmark/src/utils/atlas_download.py
 
-These tools allow the white agent to download ATLAS Open Data files
+These tools allow the purple agent to download ATLAS Open Data files
 when needed, without relying on shared filesystem with the benchmark.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 import time
 import urllib.request
@@ -20,6 +21,9 @@ try:
     HAS_ATOM = True
 except ImportError:
     HAS_ATOM = False
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -215,6 +219,7 @@ def download_atlas_data_tool(
         }
     """
     if not HAS_ATOM:
+        logger.error("atlasopenmagic library is not installed. Cannot download ATLAS data.")
         return {
             "status": "error",
             "local_paths": [],
@@ -230,6 +235,16 @@ def download_atlas_data_tool(
         
         # Build full path: base_dir/release/dataset/skim (matches Green Agent structure)
         full_output_dir = os.path.join(base_dir, release, dataset, skim)
+
+        logger.info(
+            "Starting ATLAS data download: release=%s dataset=%s skim=%s output_dir=%s max_files=%s workers=%s",
+            release,
+            dataset,
+            skim,
+            os.path.abspath(full_output_dir),
+            max_files,
+            workers,
+        )
         
         atom.set_release(release)
         os.makedirs(full_output_dir, exist_ok=True)
@@ -248,7 +263,15 @@ def download_atlas_data_tool(
         if max_files and max_files > 0:
             urls = urls[:max_files]
 
+        logger.info("Resolved %s remote ROOT file(s) for download.", len(urls))
+
         if not urls:
+            logger.warning(
+                "No files found for release=%s dataset=%s skim=%s.",
+                release,
+                dataset,
+                skim,
+            )
             return {
                 "status": "error",
                 "local_paths": [],
@@ -282,6 +305,17 @@ def download_atlas_data_tool(
 
         failed_details = [{"url": r.url, "error": r.error} for r in results if not r.ok]
 
+        logger.info(
+            "Finished ATLAS data download: ok=%s fail=%s requested=%s output_dir=%s",
+            n_ok,
+            n_fail,
+            len(urls),
+            os.path.abspath(full_output_dir),
+        )
+        if failed_details:
+            for failed in failed_details:
+                logger.warning("Download failed: url=%s error=%s", failed["url"], failed["error"])
+
         return {
             "status": "ok" if n_fail == 0 else "partial",
             "local_paths": local_paths_ordered,
@@ -297,6 +331,7 @@ def download_atlas_data_tool(
         }
 
     except Exception as e:
+        logger.exception("ATLAS data download failed.")
         return {
             "status": "error",
             "local_paths": [],

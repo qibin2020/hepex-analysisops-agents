@@ -1,12 +1,23 @@
 from typing import Any
+from pathlib import Path
+import sys
 import pytest
 import httpx
 from uuid import uuid4
 
 from a2a.client import A2ACardResolver, ClientConfig, ClientFactory
 from a2a.types import Message, Part, Role, TextPart, Task
+from a2a.utils import new_agent_text_message
 
 import json
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SRC_ROOT = PROJECT_ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
+
+from agent import PurpleAgent
+from bundle_runtime import request_mode
 
 # A2A validation helpers - adapted from https://github.com/a2aproject/a2a-inspector/blob/main/backend/validators.py
 
@@ -327,3 +338,297 @@ async def test_agent_identity_and_tools_response(agent):
             "Response didn't look like it mentioned tools/capabilities.\n"
             f"Response={resp}\noutputs={debug}"
         )
+
+
+class DummyUpdater:
+    def __init__(self) -> None:
+        self.status_updates: list[str] = []
+        self.artifacts: list[dict[str, Any]] = []
+
+    async def update_status(self, state, message) -> None:
+        value = getattr(state, "value", str(state))
+        self.status_updates.append(str(value))
+
+    async def add_artifact(self, parts, name) -> None:
+        self.artifacts.append({"parts": parts, "name": name})
+
+
+def _extract_text_from_artifact_parts(parts) -> str:
+    texts = _extract_text_from_parts(parts)
+    return "\n".join(texts)
+
+
+def _build_submission_contract() -> dict[str, Any]:
+    return {
+        "required_outputs": [
+            {"canonical_filename": "diphoton_mass_spectrum.json", "type": "json"},
+            {"canonical_filename": "diphoton_fit_summary.json", "type": "json"},
+            {"canonical_filename": "data_minus_background.json", "type": "json"},
+            {"canonical_filename": "interpretation.md", "type": "markdown"},
+            {"canonical_filename": "submission_trace.json", "type": "json"},
+        ]
+    }
+
+
+def _write_manifest(tmp_path: Path, *, invalid_json: bool = False) -> Path:
+    manifest_path = tmp_path / "input_manifest.json"
+    if invalid_json:
+        manifest_path.write_text("{not-json", encoding="utf-8")
+        return manifest_path
+
+    shared_input_dir = tmp_path / "shared_input"
+    shared_input_dir.mkdir()
+    root_file = shared_input_dir / "events.root"
+    root_file.write_text("placeholder", encoding="utf-8")
+    manifest = {
+        "task_id": "t002_hyy_v5_l1",
+        "shared_input_dir": str(shared_input_dir),
+        "input_manifest_path": str(manifest_path),
+        "files": [
+            {
+                "logical_name": "events.root",
+                "path": str(root_file),
+                "size_bytes": root_file.stat().st_size,
+            }
+        ],
+        "read_only_for_solver": True,
+    }
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    return manifest_path
+
+
+def _build_bundle_request(manifest_path: Path | str, *, mode: str = "mock") -> dict[str, Any]:
+    return {
+        "role": "task_request",
+        "task_id": "t002_hyy_v5_l1",
+        "task_type": "higgs_diphoton",
+        "mode": mode,
+        "prompt": "Return submission_bundle_v1 only.",
+        "submission_contract": _build_submission_contract(),
+        "data": {
+            "release": "2025e-13tev-beta",
+            "dataset": "data",
+            "skim": "GamGam",
+            "shared_input_dir": str(Path(manifest_path).parent / "shared_input"),
+            "input_manifest_path": str(manifest_path),
+            "read_only_for_solver": True,
+        },
+        "constraints": {
+            "response_format": "submission_bundle_v1",
+            "allow_purple_network": False,
+        },
+    }
+
+
+async def _run_agent_with_payload(payload: dict[str, Any]) -> tuple[dict[str, Any], DummyUpdater]:
+    agent = PurpleAgent()
+    updater = DummyUpdater()
+    message = new_agent_text_message(json.dumps(payload, ensure_ascii=False))
+    await agent.run(message, updater)
+    assert updater.artifacts, "Expected final artifact payload"
+    final_text = _extract_text_from_artifact_parts(updater.artifacts[-1]["parts"])
+    return json.loads(final_text), updater
+
+
+@pytest.mark.asyncio
+async def test_submission_bundle_request_returns_minimal_valid_bundle(tmp_path):
+    manifest_path = _write_manifest(tmp_path)
+    payload = _build_bundle_request(manifest_path)
+
+    bundle, updater = await _run_agent_with_payload(payload)
+
+    assert updater.status_updates[-1] == "completed"
+    assert bundle["status"] == "ok"
+    assert set(bundle["artifacts"]) == {
+        "diphoton_mass_spectrum.json",
+        "diphoton_fit_summary.json",
+        "data_minus_background.json",
+        "interpretation.md",
+        "submission_trace.json",
+    }
+    assert len(bundle["artifacts"]["interpretation.md"].strip()) > 20
+
+    trace = bundle["artifacts"]["submission_trace.json"]
+    for field in [
+        "workflow_stages",
+        "cuts_applied",
+        "observable_constructed",
+        "fit_model_family_used",
+        "output_files_generated",
+        "reported_result",
+        "baseline_assumptions_used",
+        "object_definition",
+        "derived_observables",
+        "primary_observable",
+        "histogram_definition",
+        ]:
+        assert field in trace
+    assert request_mode(payload) == "mock"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("manifest_path", "expected_error"),
+    [
+        ("", "Missing required data.input_manifest_path"),
+        ("missing.json", "Input manifest does not exist"),
+    ],
+)
+async def test_submission_bundle_request_returns_error_for_missing_manifest(tmp_path, manifest_path, expected_error):
+    resolved_manifest = manifest_path if manifest_path else ""
+    if manifest_path == "missing.json":
+        resolved_manifest = str(tmp_path / manifest_path)
+
+    payload = _build_bundle_request(resolved_manifest)
+    bundle, updater = await _run_agent_with_payload(payload)
+
+    assert updater.status_updates[-1] == "completed"
+    assert bundle["status"] == "error"
+    assert expected_error in bundle["error"]
+
+
+@pytest.mark.asyncio
+async def test_submission_bundle_request_returns_error_for_invalid_manifest_json(tmp_path):
+    manifest_path = _write_manifest(tmp_path, invalid_json=True)
+    payload = _build_bundle_request(manifest_path)
+
+    bundle, updater = await _run_agent_with_payload(payload)
+
+    assert updater.status_updates[-1] == "completed"
+    assert bundle["status"] == "error"
+    assert "not valid JSON" in bundle["error"]
+
+
+@pytest.mark.asyncio
+async def test_submission_bundle_response_is_accepted_by_benchmark_parser(tmp_path):
+    benchmark_src = Path("/Users/ranriver/Projects/AgentBeats/hepex-analysisops-benchmark/src")
+    sys.path.insert(0, str(benchmark_src))
+    try:
+        from engine.submission_bundle import parse_submission_bundle
+
+        manifest_path = _write_manifest(tmp_path)
+        payload = _build_bundle_request(manifest_path)
+
+        bundle, _ = await _run_agent_with_payload(payload)
+        parsed = parse_submission_bundle(bundle, payload["submission_contract"])
+    finally:
+        try:
+            sys.path.remove(str(benchmark_src))
+        except ValueError:
+            pass
+
+    assert parsed["status"] == "ok"
+
+
+def test_request_scoped_download_tool_overrides_hallucinated_params(monkeypatch):
+    captured = {}
+
+    def fake_download(**kwargs):
+        captured["kwargs"] = kwargs
+        return {"status": "ok", "local_paths": ["/tmp/fake.root"], "n_ok": 1, "n_fail": 0, "n_requested": 1}
+
+    monkeypatch.setattr("agent.raw_download_atlas_data_tool", fake_download)
+
+    agent = PurpleAgent()
+    agent._set_request_download_defaults(
+        {
+            "data": {
+                "release": "2025e-13tev-beta",
+                "dataset": "data",
+                "skim": "GamGam",
+                "protocol": "https",
+                "max_files": 1,
+            }
+        }
+    )
+
+    result = agent.download_atlas_data_tool(
+        release="wrong-release",
+        dataset="mc",
+        skim="diphoton_skim",
+        protocol="root",
+        max_files=0,
+    )
+
+    assert result["status"] == "ok"
+    assert captured["kwargs"] == {
+        "skim": "GamGam",
+        "release": "2025e-13tev-beta",
+        "dataset": "data",
+        "protocol": "https",
+        "output_dir": "",
+        "max_files": 1,
+        "workers": 4,
+    }
+
+
+def test_request_scoped_download_tool_reuses_cached_result(monkeypatch):
+    call_count = {"n": 0}
+
+    def fake_download(**kwargs):
+        call_count["n"] += 1
+        return {
+            "status": "ok",
+            "local_paths": ["/tmp/fake.root"],
+            "n_ok": 1,
+            "n_fail": 0,
+            "n_requested": 1,
+        }
+
+    monkeypatch.setattr("agent.raw_download_atlas_data_tool", fake_download)
+
+    agent = PurpleAgent()
+    agent._set_request_download_defaults(
+        {
+            "data": {
+                "release": "2025e-13tev-beta",
+                "dataset": "data",
+                "skim": "GamGam",
+                "max_files": 1,
+            }
+        }
+    )
+
+    first = agent.download_atlas_data_tool(skim="GamGam", max_files=1)
+    second = agent.download_atlas_data_tool(skim="diphoton_skim", max_files=0)
+
+    assert first["status"] == "ok"
+    assert second["status"] == "ok"
+    assert call_count["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_submission_bundle_call_white_mode_uses_runner_instead_of_mock(tmp_path, monkeypatch):
+    manifest_path = _write_manifest(tmp_path)
+    payload = _build_bundle_request(manifest_path, mode="call_white")
+    agent = PurpleAgent()
+    updater = DummyUpdater()
+
+    class FakeEvent:
+        def __init__(self, text: str) -> None:
+            self.content = type(
+                "Content",
+                (),
+                {"parts": [type("Part", (), {"text": text})()]},
+            )()
+            self.error_message = None
+
+        def is_final_response(self) -> bool:
+            return True
+
+    async def fake_run_async(*args, **kwargs):
+        yield FakeEvent(json.dumps({"status": "ok", "artifacts": {"from_runner": True}}))
+
+    async def fake_create_session(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(agent.runner, "run_async", fake_run_async)
+    monkeypatch.setattr(agent.session_service, "create_session", fake_create_session)
+
+    message = new_agent_text_message(json.dumps(payload, ensure_ascii=False))
+    await agent.run(message, updater)
+
+    final_text = _extract_text_from_artifact_parts(updater.artifacts[-1]["parts"])
+    bundle = json.loads(final_text)
+    assert updater.status_updates[-1] == "completed"
+    assert bundle == {"status": "ok", "artifacts": {"from_runner": True}}

@@ -6,7 +6,7 @@
 
 ## Overview
 
-This is the **Purple Agent** (participant) for the [HEPEx AnalysisOps Benchmark](https://github.com/ranriver/hepex-analysisops-benchmark). It uses the [Google GenAI SDK](https://github.com/googleapis/python-genai) with specialized physics tools to analyze ATLAS Open Data.
+This is the **Purple Agent** (participant) for the [HEPEx AnalysisOps Benchmark](https://github.com/ranriver/hepex-analysisops-benchmark). It uses the Google ADK runtime with an OpenAI-backed model configuration and specialized physics tools to analyze ATLAS Open Data.
 
 ## Features
 
@@ -30,7 +30,10 @@ docker pull ghcr.io/ranriver/hepex-analysisops-agents:latest
 docker build -t hepex-purple-agent:local .
 
 # Run (listens on port 9009)
-docker run -p 9009:9009 -e GOOGLE_API_KEY="..." ghcr.io/ranriver/hepex-analysisops-agents:latest
+docker run -p 9009:9009 \
+  -e OPENAI_API_KEY="..." \
+  -e HEPEX_AGENT_MODEL="openai/gpt-5" \
+  ghcr.io/ranriver/hepex-analysisops-agents:latest
 ```
 
 ### Local Development
@@ -39,8 +42,9 @@ docker run -p 9009:9009 -e GOOGLE_API_KEY="..." ghcr.io/ranriver/hepex-analysiso
 # Install dependencies
 uv sync
 
-# Set API key
-export GOOGLE_API_KEY="..."
+# Set API key and optional model override
+export OPENAI_API_KEY="..."
+export HEPEX_AGENT_MODEL="openai/gpt-5"
 
 # Run the agent
 uv run src/server.py --host 0.0.0.0 --port 9009
@@ -50,7 +54,7 @@ uv run src/server.py --host 0.0.0.0 --port 9009
 
 ### Agent Card
 
-- **Name**: `HEPEx White Agent`
+- **Name**: `HEPEx Purple Agent`
 - **Port**: 9009 (A2A standard)
 - **Protocol**: A2A (Agent-to-Agent)
 
@@ -58,7 +62,9 @@ uv run src/server.py --host 0.0.0.0 --port 9009
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `GOOGLE_API_KEY` | Yes | Google AI API key for Gemini |
+| `OPENAI_API_KEY` | Yes | OpenAI API key used by the default ADK LiteLLM model backend |
+| `HEPEX_OPENAI_MODEL` | No | Fallback OpenAI model string for ADK LiteLLM when `HEPEX_AGENT_MODEL` is unset |
+| `HEPEX_AGENT_MODEL` | No | Generic model override; if set, takes precedence over `HEPEX_OPENAI_MODEL` |
 | `HEPEX_DATA_DIR` | No | Data storage directory (default: `/tmp/atlas_data`) |
 
 ### Data Directory Structure
@@ -81,7 +87,7 @@ Example:
 ├── src/
 │   ├── server.py          # A2A server entrypoint
 │   ├── agent.py           # Agent logic
-│   ├── executor.py        # Task executor
+│   ├── executor.py        # A2A executor for the purple agent
 │   └── tools/             # Physics analysis tools
 │       ├── data_tools.py  # ATLAS data download
 │       ├── root_tools.py  # ROOT file analysis
