@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol
 
+from agent_02_scifi_oh.loop import SciFiLoop
 from bundle_runtime import extract_required_output_names, request_mode
 
 
@@ -250,9 +251,20 @@ def debug_log_path(work_dir: Path | None = None) -> Path:
     return (work_dir or Path.cwd()) / "debug_oh_output.log"
 
 
+def scifi_oh_debug_log_path(work_dir: Path | None = None) -> Path:
+    return (work_dir or Path.cwd()) / "debug_scifi_oh_output.log"
+
+
 def debug_log(blocks: list[tuple[str, str]], work_dir: Path | None = None) -> None:
     log_path = debug_log_path(work_dir)
     with log_path.open("a", encoding="utf-8") as f:
+        for title, content in blocks:
+            f.write(f"{title}:\n{content}\n")
+        f.write("=" * 40 + "\n")
+
+
+def write_debug_log(path: Path, blocks: list[tuple[str, str]]) -> None:
+    with path.open("a", encoding="utf-8") as f:
         for title, content in blocks:
             f.write(f"{title}:\n{content}\n")
         f.write("=" * 40 + "\n")
@@ -427,10 +439,177 @@ class OpenHarnessSolverBackend:
         return final_text
 
 
+class SciFiOhLoopSolverBackend:
+    name = "agent_2_scifi_oh"
+
+    def _system_prompt(self) -> str:
+        prompt_path = Path(__file__).resolve().parent / "agent_02_scifi_oh" / "AGENTS.md"
+        try:
+            return prompt_path.read_text(encoding="utf-8").strip()
+        except Exception as exc:
+            logger.warning("Failed to read SciFi system prompt from %s: %s", prompt_path, exc)
+            return "You are a SciFi-style scientific analysis worker."
+
+    async def run(
+        self,
+        prompt: str,
+        req_json: dict[str, Any] | None,
+        *,
+        system_prompt: str,
+        status: StatusCallback = noop_status,
+        input_manifest: dict[str, Any] | None = None,
+        work_dir: Path | None = None,
+    ) -> str:
+        del system_prompt
+        if work_dir is None:
+            work_dir = resolve_work_dir(req_json)
+        env = os.environ.copy()
+        if work_dir is not None:
+            env["HEPEX_SOLVER_WORK_DIR"] = str(work_dir)
+            env["HEPEX_OUTPUT_DIR"] = str(work_dir)
+
+        max_attempts = int(
+            os.environ.get("SCIFI_OH_MAX_RETRIES", os.environ.get("SCIFI_MAX_RETRIES", "2"))
+        )
+        scifi_system_prompt = self._system_prompt()
+
+        log_path = scifi_oh_debug_log_path(work_dir)
+
+        await status(
+            (
+                f"Solver backend {self.name}: prepared SciFi-OH controller with "
+                f"OpenHarness executor. {summarize_request(req_json, work_dir)}"
+            )
+        )
+        if input_manifest is not None:
+            await status(summarize_manifest(input_manifest))
+        await status(f"Solver backend {self.name}: debug log: {log_path}")
+
+        async def worker(sam_prompt: str, attempt: int, total_attempts: int) -> str:
+            cmd = [
+                "oh",
+                "--permission-mode",
+                "full_auto",
+                "--dangerously-skip-permissions",
+                "--system-prompt",
+                scifi_system_prompt,
+                "--print",
+                sam_prompt,
+            ]
+
+            await status(
+                (
+                    f"Solver backend {self.name}: starting OpenHarness executor attempt "
+                    f"{attempt}/{total_attempts} under SciFi-OH controller."
+                )
+            )
+
+            write_debug_log(
+                log_path,
+                [
+                    ("--- Backend ---", self.name),
+                    ("--- Worker Executor ---", "openharness"),
+                    ("--- Request Metadata ---", json_dump(req_json or {})),
+                    ("--- SciFi-OH Attempt ---", str(attempt)),
+                    ("--- Work Dir ---", str(work_dir or Path.cwd())),
+                    ("--- SAM Prompt ---", sam_prompt),
+                ],
+            )
+
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=str(work_dir) if work_dir is not None else None,
+                    env=env,
+                )
+                stdout, stderr = await process.communicate()
+            except Exception as exc:
+                await status(
+                    (
+                        f"Solver backend {self.name}: SciFi-OH worker attempt {attempt}/{total_attempts} "
+                        f"raised {type(exc).__name__} from OpenHarness executor: {exc}."
+                    )
+                )
+                return json_dump(
+                    {
+                        "status": "error",
+                        "error": f"SciFi-OH OpenHarness executor failed: {type(exc).__name__}: {exc}",
+                    }
+                )
+
+            stdout_text = stdout.decode(errors="replace")
+            stderr_text = stderr.decode(errors="replace")
+
+            await status(
+                (
+                    f"Solver backend {self.name}: SciFi-OH worker attempt {attempt}/{total_attempts} "
+                    f"finished via OpenHarness executor: exit={process.returncode}, stdout={len(stdout_text)} chars, "
+                    f"stderr={len(stderr_text)} chars."
+                )
+            )
+
+            write_debug_log(
+                log_path,
+                [
+                    ("--- Backend ---", self.name),
+                    ("--- Worker Executor ---", "openharness"),
+                    ("--- SciFi-OH Attempt Result ---", str(attempt)),
+                    ("STDOUT", stdout_text),
+                    ("STDERR", stderr_text),
+                ],
+            )
+
+            if process.returncode == 0 and stdout_text.strip():
+                final_text = stdout_text.strip()
+                if not _is_submission_bundle_json(final_text):
+                    recovered_bundle = recover_submission_bundle_from_outputs(req_json, work_dir)
+                    if recovered_bundle is not None:
+                        final_text = json_dump(recovered_bundle)
+                        await status(
+                            (
+                                f"Solver backend {self.name}: recovered submission_bundle_v1 "
+                                "from solver output files after non-JSON stdout."
+                            )
+                        )
+                await status(summarize_response(final_text))
+                return final_text
+
+            err_str = stderr_text.strip() or "OpenHarness returned empty stdout."
+            final_text = json_dump(
+                {
+                    "status": "error",
+                    "error": f"SciFi-OH OpenHarness executor failed with exit code {process.returncode}: {err_str}",
+                }
+            )
+            await status(summarize_response(final_text))
+            return final_text
+
+        loop = SciFiLoop(worker=worker, status=status, max_attempts=max_attempts)
+        result = await loop.run(
+            base_prompt=prompt,
+            req_json=req_json,
+            input_manifest=input_manifest,
+            work_dir=work_dir,
+        )
+        await status(
+            (
+                f"Solver backend {self.name}: completed SciFi-OH loop after "
+                f"{result.attempts} attempt(s); review={result.review.summary}."
+            )
+        )
+        await status(summarize_response(result.final_text))
+        logger.debug("Output from solver backend %s:\n%s", self.name, result.final_text)
+        return result.final_text
+
+
 _BACKENDS: dict[str, SolverBackend] = {
     DEFAULT_SOLVER_BACKEND: OpenHarnessSolverBackend(),
     "openharness": OpenHarnessSolverBackend(),
     "oh": OpenHarnessSolverBackend(),
+    "agent_2_scifi_oh": SciFiOhLoopSolverBackend(),
+    "scifi_oh": SciFiOhLoopSolverBackend(),
 }
 
 

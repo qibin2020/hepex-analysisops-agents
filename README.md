@@ -14,6 +14,18 @@ agent_1_oh
 structured so additional solver backends can be registered without rewriting
 the A2A transport layer.
 
+An experimental SciFi-OH backend is also available:
+
+```text
+agent_2_scifi_oh
+```
+
+`agent_2_scifi_oh` keeps the same Green Agent wire format and still uses
+OpenHarness as the worker executor, but wraps that executor with a lightweight
+SciFi-inspired controller: SAM prompt rendering, independent deterministic
+review, and bounded retry with review feedback. It intentionally does not
+vendor the full SciFi Apptainer/Pam/Cam/SciF runtime.
+
 ## Repository Role
 
 This repo owns the participant side of the benchmark:
@@ -47,7 +59,9 @@ src/agent.py
 src/solver_backends.py
   Solver backend registry:
   - agent_1_oh / openharness / oh
+  - agent_2_scifi_oh / scifi_oh
   - OpenHarness subprocess execution
+  - SciFi-OH independent review loop
   - retry handling
   - debug log writing
   - backend progress status
@@ -57,6 +71,14 @@ src/agent_01_oh/
   - AGENTS.md system prompt
   - sm-ana-aod OpenHarness skills submodule
   Docker copies these assets into the locations expected by OpenHarness.
+
+src/agent_02_scifi_oh/
+  Backend-owned SciFi-OH assets:
+  - AGENTS.md worker/reviewer prompt
+  - prompt_builder.py SAM prompt renderer
+  - review.py deterministic bundle and Hyy trace review
+  - loop.py bounded Prescan -> Work -> Independent Review loop
+  - skills/ small text skills for Hyy L1/L2/L3 and bundle review.
 
 src/bundle_runtime.py
   Request parsing, input manifest loading, deterministic mock bundle helpers
@@ -120,11 +142,27 @@ Registered names today:
 - `agent_1_oh`
 - `openharness`
 - `oh`
+- `agent_2_scifi_oh`
+- `scifi_oh`
 
 The `agent_1_oh` backend's prompt and skill assets live under
 `src/agent_01_oh/`. Keep backend-specific assets there so future backends can
 ship their own prompts, skills, configs, or tool adapters without changing the
 transport layer.
+
+The `agent_2_scifi_oh` backend's assets live under `src/agent_02_scifi_oh/`.
+It is designed for L1/L2/L3 Hyy submission-bundle requests and falls back to
+generic contract review for unknown tasks. Select it explicitly in local
+leaderboard runs:
+
+```bash
+python3 scripts/local_shared_submit.py \
+  --task-id t002_hyy_v5_l1 \
+  --solver-backend agent_2_scifi_oh \
+  --max-files 1 \
+  --build-local-images \
+  --no-commit
+```
 
 The OpenHarness skill pack is a Git submodule:
 
@@ -219,15 +257,22 @@ The Purple Agent emits A2A working statuses for:
 - input manifest file count and size
 - solver work directory
 - OpenHarness attempt start/end
+- SciFi-OH controller attempt/review status when `agent_2_scifi_oh` is selected
 - stdout/stderr character counts
 - retry decisions
 - final bundle status and artifact list
 
-OpenHarness debug logs are written under the task work directory:
+Backend debug logs are written under the task work directory:
 
 ```text
-<solver_work>/debug_oh_output.log
+<solver_work>/debug_oh_output.log       # agent_1_oh / openharness / oh
+<solver_work>/debug_scifi_oh_output.log # agent_2_scifi_oh / scifi_oh
 ```
+
+For `agent_2_scifi_oh`, the log is named after the SciFi-OH controller, and the
+log records the worker executor as `openharness`. The unsuffixed names
+`agent_2_scifi` and `scifi` are left free for a future closer-to-upstream SciFi
+backend.
 
 The backend may also create analysis scripts and logs under the same
 `solver_work` directory. Those files are useful for local debugging but are not
@@ -262,6 +307,7 @@ result into `output/runs/<run_id>/results.json`.
 | `HEPEX_OPENAI_MODEL` | no | Fallback OpenAI model setting |
 | `HEPEX_SOLVER_WORK_DIR` | set by backend | Per-task solver working directory |
 | `HEPEX_OUTPUT_DIR` | set by backend | Alias for the solver output directory |
+| `SCIFI_OH_MAX_RETRIES` | no | Maximum SciFi-OH worker attempts for `agent_2_scifi_oh` (default `2`) |
 
 ## Common Failure Modes
 
