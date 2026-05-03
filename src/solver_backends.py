@@ -270,6 +270,38 @@ def write_debug_log(path: Path, blocks: list[tuple[str, str]]) -> None:
         f.write("=" * 40 + "\n")
 
 
+def print_debug_log_to_container_log(path: Path, *, env_limit_name: str = "SCIFI_OH_PRINT_DEBUG_LOG_MAX_CHARS") -> None:
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        logger.info("SciFi-OH debug log not found: %s", path)
+        return
+    except Exception as exc:
+        logger.warning("Failed to print SciFi-OH debug log %s: %s", path, exc)
+        return
+
+    raw_limit = os.environ.get(env_limit_name, "0")
+    try:
+        limit = max(0, int(raw_limit))
+    except ValueError:
+        limit = 0
+
+    rendered = text
+    suffix = ""
+    if limit and len(text) > limit:
+        rendered = text[-limit:]
+        suffix = f"; showing last {limit} chars"
+
+    logger.info(
+        "===== BEGIN %s (%s chars%s) =====\n%s\n===== END %s =====",
+        path.name,
+        len(text),
+        suffix,
+        rendered,
+        path.name,
+    )
+
+
 class OpenHarnessSolverBackend:
     name = DEFAULT_SOLVER_BACKEND
 
@@ -600,6 +632,7 @@ class SciFiOhLoopSolverBackend:
             )
         )
         await status(summarize_response(result.final_text))
+        print_debug_log_to_container_log(log_path)
         logger.debug("Output from solver backend %s:\n%s", self.name, result.final_text)
         return result.final_text
 

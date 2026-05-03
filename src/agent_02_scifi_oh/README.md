@@ -48,6 +48,10 @@ Inside that log the executor is explicitly recorded as `openharness`, so local
 runs show both facts: SciFi-OH backend/controller, OpenHarness worker
 executor.
 
+For CI debugging, the backend also prints this file to the Purple container log
+near the end of each SciFi-OH task. Search the GitHub Actions log for
+`BEGIN debug_scifi_oh_output.log`.
+
 Registered backend names:
 
 - `agent_2_scifi_oh`

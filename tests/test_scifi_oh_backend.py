@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 import sys
 
@@ -263,7 +264,7 @@ async def test_scifi_loop_retries_with_feedback(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_scifi_oh_backend_retries_invalid_l1_trace(tmp_path, monkeypatch):
+async def test_scifi_oh_backend_retries_invalid_l1_trace(tmp_path, monkeypatch, caplog):
     req = _l1_request(tmp_path)
     manifest = _manifest(tmp_path)
     work_dir = tmp_path / "solver_work"
@@ -271,6 +272,7 @@ async def test_scifi_oh_backend_retries_invalid_l1_trace(tmp_path, monkeypatch):
     backend = get_solver_backend("agent_2_scifi_oh")
     calls = {"count": 0}
     statuses: list[str] = []
+    caplog.set_level(logging.INFO, logger="solver_backends")
 
     class FakeProcess:
         returncode = 0
@@ -311,6 +313,8 @@ async def test_scifi_oh_backend_retries_invalid_l1_trace(tmp_path, monkeypatch):
     debug_text = (work_dir / "debug_scifi_oh_output.log").read_text(encoding="utf-8")
     assert "--- Worker Executor ---" in debug_text
     assert "openharness" in debug_text
+    assert "===== BEGIN debug_scifi_oh_output.log" in caplog.text
+    assert "===== END debug_scifi_oh_output.log" in caplog.text
     assert not (work_dir / "debug_oh_output.log").exists()
     assert not (work_dir / "debug_scifi_output.log").exists()
 
