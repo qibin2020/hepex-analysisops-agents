@@ -6,10 +6,9 @@ Before returning, check the bundle as if another agent will reject it:
 - Required artifact names are present and no undeclared artifact names appear.
 - JSON artifacts are objects and markdown artifacts are strings.
 - Required schema fields are present.
-- Histogram arrays align: edges are one longer than counts, and uncertainties
-  match counts.
-- Residual arrays align with either bin centers or bin edges.
-- `submission_trace.json` agrees with `diphoton_fit_summary.json` on the signal
-  peak field.
-- `interpretation.md` is consistent with the computed fit and residuals.
-
+- Declared field types are respected.
+- Contract constraints such as array alignment, minimum lengths, and
+  `contains_all` are satisfied.
+- `submission_trace.json` lists the generated required outputs when the
+  contract asks for `output_files_generated`.
+- `interpretation.md` is consistent with the computed artifacts and trace.

@@ -17,15 +17,14 @@ def detect_task_level(req_json: dict[str, Any] | None) -> str:
         return "generic"
     contract = req_json.get("submission_contract", {})
     level = contract.get("level") if isinstance(contract, dict) else None
+    if isinstance(level, str) and level.lower() in {"l1", "l2", "l3"}:
+        return level.lower()
     task_type = str(req_json.get("task_type") or "").lower()
     task_id = str(req_json.get("task_id") or "").lower()
-    combined = f"{level or ''} {task_type} {task_id}"
-    if "l1" in combined or "hyy_l1" in combined or "t002_hyy_v5_l1" in combined:
-        return "l1"
-    if "l2" in combined or "hyy_l2" in combined or "t003_hyy_v5_l2" in combined:
-        return "l2"
-    if "l3" in combined or "hyy_l3" in combined or "t004_hyy_v5_l3" in combined:
-        return "l3"
+    combined = f" {task_type} {task_id} "
+    for value in ("l1", "l2", "l3"):
+        if f"_{value}" in combined or f"-{value}" in combined or f" {value} " in combined:
+            return value
     return "generic"
 
 
@@ -50,6 +49,56 @@ def _required_output_names(req_json: dict[str, Any] | None) -> list[str]:
     return names
 
 
+def _artifact_summary(contract: dict[str, Any], section: str) -> list[dict[str, Any]]:
+    values = contract.get(section, [])
+    if not isinstance(values, list):
+        return []
+    summary: list[dict[str, Any]] = []
+    for item in values:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("canonical_filename")
+        if isinstance(name, str):
+            summary.append(
+                {
+                    "canonical_filename": name,
+                    "type": item.get("type", "json"),
+                    "machine_readable": item.get("machine_readable"),
+                }
+            )
+    return summary
+
+
+def build_contract_summary(req_json: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(req_json, dict):
+        return {"required_outputs": [], "optional_outputs": [], "schemas": {}}
+    contract = req_json.get("submission_contract", {})
+    if not isinstance(contract, dict):
+        return {"required_outputs": [], "optional_outputs": [], "schemas": {}}
+
+    schemas = contract.get("schemas", {})
+    schema_summary: dict[str, Any] = {}
+    if isinstance(schemas, dict):
+        for name, schema in schemas.items():
+            if not isinstance(schema, dict):
+                continue
+            schema_summary[str(name)] = {
+                "required_fields": schema.get("required_fields", []),
+                "nested_required_fields": list((schema.get("nested_required_fields") or {}).keys())
+                if isinstance(schema.get("nested_required_fields"), dict)
+                else [],
+                "constraints": schema.get("constraints", {}),
+            }
+
+    return {
+        "version": contract.get("version"),
+        "level": contract.get("level"),
+        "required_outputs": _artifact_summary(contract, "required_outputs"),
+        "optional_outputs": _artifact_summary(contract, "optional_outputs"),
+        "schemas": schema_summary,
+    }
+
+
 def build_sam_prompt(
     base_prompt: str,
     req_json: dict[str, Any] | None,
@@ -66,11 +115,12 @@ def build_sam_prompt(
     contract = req_json.get("submission_contract", {}) if isinstance(req_json, dict) else {}
     constraints = req_json.get("constraints", {}) if isinstance(req_json, dict) else {}
 
-    skills = [_load_skill("bundle_contract_review.md")]
-    if task_level == "l1":
-        skills.append(_load_skill("hyy_l1.md"))
-    elif task_level in {"l2", "l3"}:
-        skills.append(_load_skill("hyy_l2_l3.md"))
+    skills = [
+        _load_skill("contract_driven_analysis.md"),
+        _load_skill("scientific_trace.md"),
+        _load_skill("evidence_consistency.md"),
+        _load_skill("bundle_contract_review.md"),
+    ]
 
     feedback_block = ""
     if review_feedback:
@@ -96,7 +146,7 @@ def build_sam_prompt(
         [
             "---",
             "Rank: 2",
-            "Skills: hyy_analysis, bundle_contract_review",
+            "Skills: contract_driven_analysis, scientific_trace, evidence_consistency, bundle_contract_review",
             "---",
             "",
             f"# AgentBeats HEPEx {task_level.upper()} Submission Bundle",
@@ -117,6 +167,11 @@ def build_sam_prompt(
                     "required_outputs": required_outputs,
                 }
             ),
+            "```",
+            "",
+            "### Extracted Contract Summary",
+            "```json",
+            _json_dump(build_contract_summary(req_json)),
             "```",
             "",
             "### Submission Contract",
@@ -140,7 +195,7 @@ def build_sam_prompt(
             feedback_block,
             "",
             "## Todo",
-            "1. Use the runtime manifest and task instructions to run the requested Hyy analysis.",
+            "1. Use the runtime manifest and task instructions to run the requested analysis.",
             "2. Generate any scripts, logs, plots, and intermediate files under the solver work directory.",
             "3. Build every required artifact from actual computation over the provided input files.",
             "4. Return exactly one `submission_bundle_v1` JSON object on stdout.",
@@ -150,7 +205,7 @@ def build_sam_prompt(
             "- Top-level JSON has `status` and `artifacts`.",
             "- `artifacts` contains every required canonical filename and no undeclared names.",
             "- JSON artifacts are JSON objects; markdown artifacts are strings.",
-            "- Required schema fields and trace fields are present for the detected task level.",
-            "- Histogram, residual, fit, interpretation, and trace claims are internally consistent.",
+            "- Required schema fields, nested fields, field types, and contract constraints are satisfied.",
+            "- `submission_trace.json`, numeric artifacts, and `interpretation.md` tell the same story.",
         ]
     ).strip()

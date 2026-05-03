@@ -2,50 +2,13 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from dataclasses import dataclass
 from typing import Any
-
-from .prompt_builder import detect_task_level
 
 
 JSON_TYPES = {"json", "table_json", "image_ref"}
 TEXT_TYPES = {"markdown", "text"}
-
-L1_STAGE_IDS = [
-    "data_loading",
-    "event_selection",
-    "diphoton_mass_construction",
-    "spectrum_histogramming",
-    "uncertainty_assignment",
-    "spectrum_fitting",
-    "signal_interpretation",
-]
-
-L1_CUT_IDS = {
-    "at_least_two_photons",
-    "leading_photon_tight_id",
-    "subleading_photon_tight_id",
-    "leading_photon_pt",
-    "subleading_photon_pt",
-    "leading_photon_isolation",
-    "subleading_photon_isolation",
-    "leading_photon_eta_transition_veto",
-    "subleading_photon_eta_transition_veto",
-    "diphoton_mass_nonzero",
-    "leading_photon_pt_over_m_yy",
-    "subleading_photon_pt_over_m_yy",
-}
-
-L2_L3_STAGE_FAMILIES = {
-    "data_access",
-    "object_or_event_selection",
-    "observable_construction",
-    "spectrum_or_summary_construction",
-    "inference_or_signal_localization",
-    "residual_or_background_subtraction",
-    "validation",
-    "interpretation",
-}
 
 
 @dataclass
@@ -96,6 +59,8 @@ def _declared_type_map(contract: dict[str, Any]) -> dict[str, str]:
 
 
 def _get_path(payload: Any, path: str) -> Any:
+    if isinstance(payload, dict) and path in payload:
+        return payload[path]
     current = payload
     for part in path.split("."):
         if isinstance(current, dict):
@@ -105,24 +70,208 @@ def _get_path(payload: Any, path: str) -> Any:
     return current
 
 
-def _as_number(value: Any) -> float | None:
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, (int, float)) and math.isfinite(float(value)):
-        return float(value)
-    return None
+def _is_number(value: Any) -> bool:
+    return not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(float(value))
 
 
-def _first_number(payload: dict[str, Any], names: list[str]) -> float | None:
-    for name in names:
-        value = _get_path(payload, name)
-        number = _as_number(value)
-        if number is not None:
-            return number
-    return None
+def _is_type(value: Any, type_name: str) -> bool:
+    type_name = type_name.lower()
+    if type_name == "string":
+        return isinstance(value, str)
+    if type_name == "integer":
+        return not isinstance(value, bool) and isinstance(value, int)
+    if type_name in {"float", "number"}:
+        return _is_number(value)
+    if type_name == "boolean":
+        return isinstance(value, bool)
+    if type_name == "object":
+        return isinstance(value, dict)
+    if type_name == "array":
+        return isinstance(value, list)
+    if type_name == "array_object":
+        return isinstance(value, list) and all(isinstance(item, dict) for item in value)
+    if type_name == "array_string":
+        return isinstance(value, list) and all(isinstance(item, str) for item in value)
+    if type_name == "array_int":
+        return isinstance(value, list) and all(not isinstance(item, bool) and isinstance(item, int) for item in value)
+    if type_name == "array_float" or type_name == "array_number":
+        return isinstance(value, list) and all(_is_number(item) for item in value)
+    if type_name == "array_float_len_2" or type_name == "array_number_len_2":
+        return isinstance(value, list) and len(value) == 2 and all(_is_number(item) for item in value)
+    return True
 
 
 def _check_required_schema_fields(
+    artifact_name: str,
+    artifact: Any,
+    schema: dict[str, Any],
+    errors: list[str],
+) -> None:
+    if not isinstance(artifact, dict):
+        return
+    required = schema.get("required_fields", [])
+    if isinstance(required, list):
+        for field in required:
+            if isinstance(field, str) and field not in artifact:
+                errors.append(f"{artifact_name} missing required field {field}")
+
+    nested = schema.get("nested_required_fields", {})
+    if not isinstance(nested, dict):
+        return
+    for field_path, nested_schema in nested.items():
+        if not isinstance(field_path, str) or not isinstance(nested_schema, dict):
+            continue
+        target = _get_path(artifact, field_path)
+        nested_required = nested_schema.get("required_fields", [])
+        if target is None:
+            errors.append(f"{artifact_name}.{field_path} missing required object")
+            continue
+        if not isinstance(nested_required, list):
+            continue
+        if isinstance(target, list):
+            for idx, value in enumerate(target):
+                if not isinstance(value, dict):
+                    errors.append(f"{artifact_name}.{field_path}[{idx}] must be an object")
+                    continue
+                for nested_field in nested_required:
+                    if isinstance(nested_field, str) and nested_field not in value:
+                        errors.append(
+                            f"{artifact_name}.{field_path}[{idx}] missing required field {nested_field}"
+                        )
+        elif isinstance(target, dict):
+            for nested_field in nested_required:
+                if isinstance(nested_field, str) and nested_field not in target:
+                    errors.append(f"{artifact_name}.{field_path} missing required field {nested_field}")
+        else:
+            errors.append(f"{artifact_name}.{field_path} must be an object or list of objects")
+
+
+def _check_field_types(
+    artifact_name: str,
+    artifact: Any,
+    schema: dict[str, Any],
+    errors: list[str],
+) -> None:
+    if not isinstance(artifact, dict):
+        return
+    field_types = schema.get("field_types", {})
+    if isinstance(field_types, dict):
+        for field_path, type_name in field_types.items():
+            if not isinstance(field_path, str) or not isinstance(type_name, str):
+                continue
+            value = _get_path(artifact, field_path)
+            if value is not None and not _is_type(value, type_name):
+                errors.append(f"{artifact_name}.{field_path} must match field type {type_name}")
+
+    nested = schema.get("nested_required_fields", {})
+    if not isinstance(nested, dict):
+        return
+    for field_path, nested_schema in nested.items():
+        if not isinstance(field_path, str) or not isinstance(nested_schema, dict):
+            continue
+        target = _get_path(artifact, field_path)
+        nested_types = nested_schema.get("field_types", {})
+        if not isinstance(nested_types, dict):
+            continue
+        targets = target if isinstance(target, list) else [target]
+        for idx, value in enumerate(targets):
+            if not isinstance(value, dict):
+                continue
+            label = f"{artifact_name}.{field_path}[{idx}]" if isinstance(target, list) else f"{artifact_name}.{field_path}"
+            for nested_field, type_name in nested_types.items():
+                if not isinstance(nested_field, str) or not isinstance(type_name, str):
+                    continue
+                nested_value = _get_path(value, nested_field)
+                if nested_value is not None and not _is_type(nested_value, type_name):
+                    errors.append(f"{label}.{nested_field} must match field type {type_name}")
+
+
+def _check_array_alignment(
+    artifact_name: str,
+    artifact: Any,
+    schema: dict[str, Any],
+    errors: list[str],
+) -> None:
+    if not isinstance(artifact, dict):
+        return
+    constraints = schema.get("constraints", {})
+    if not isinstance(constraints, dict):
+        return
+    for rule in constraints.get("array_alignment", []) or []:
+        if not isinstance(rule, dict):
+            continue
+        fields = rule.get("fields", [])
+        relation = rule.get("relation")
+        if not isinstance(fields, list) or len(fields) != 2:
+            continue
+        left = _get_path(artifact, str(fields[0]))
+        right = _get_path(artifact, str(fields[1]))
+        if not isinstance(left, list) or not isinstance(right, list):
+            continue
+        if relation == "edges_equals_counts_plus_one" and len(left) != len(right) + 1:
+            errors.append(
+                f"{artifact_name} array alignment failed: {fields[0]} must be one longer than {fields[1]}"
+            )
+        if relation == "same_length" and len(left) != len(right):
+            errors.append(
+                f"{artifact_name} array alignment failed: {fields[0]} and {fields[1]} must have same length"
+            )
+
+
+def _check_field_constraints(
+    artifact_name: str,
+    artifact: Any,
+    schema: dict[str, Any],
+    errors: list[str],
+) -> None:
+    if not isinstance(artifact, dict):
+        return
+    constraints = schema.get("constraints", {})
+    if not isinstance(constraints, dict):
+        return
+    for field, rule in constraints.items():
+        if field == "array_alignment" or not isinstance(rule, dict):
+            continue
+        value = _get_path(artifact, field)
+        if "min_length" in rule:
+            try:
+                min_length = int(rule["min_length"])
+            except Exception:
+                min_length = 0
+            if not hasattr(value, "__len__") or len(value) < min_length:
+                errors.append(f"{artifact_name}.{field} must have length at least {min_length}")
+        contains_all = rule.get("contains_all")
+        if isinstance(contains_all, list):
+            actual = {str(item) for item in value} if isinstance(value, list) else set()
+            missing = sorted(str(item) for item in contains_all if str(item) not in actual)
+            if missing:
+                errors.append(f"{artifact_name}.{field} missing required value(s): {missing}")
+
+
+def _check_interpretation_constraints(
+    artifact_name: str,
+    payload: Any,
+    schema: dict[str, Any],
+    errors: list[str],
+) -> None:
+    if not isinstance(payload, str):
+        return
+    constraints = schema.get("constraints", {}) if isinstance(schema, dict) else {}
+    if not isinstance(constraints, dict):
+        return
+    text = payload.strip()
+    if constraints.get("non_empty") and not text:
+        errors.append(f"{artifact_name} must be non-empty")
+    if "min_characters" in constraints:
+        try:
+            min_chars = int(constraints["min_characters"])
+        except Exception:
+            min_chars = 1
+        if len(text) < min_chars:
+            errors.append(f"{artifact_name} must be at least {min_chars} characters")
+
+
+def _check_contract_schemas(
     artifacts: dict[str, Any],
     contract: dict[str, Any],
     errors: list[str],
@@ -133,207 +282,169 @@ def _check_required_schema_fields(
     for name, schema in schemas.items():
         if name not in artifacts or not isinstance(schema, dict):
             continue
-        artifact = artifacts[name]
-        if not isinstance(artifact, dict):
+        payload = artifacts[name]
+        _check_required_schema_fields(name, payload, schema, errors)
+        _check_field_types(name, payload, schema, errors)
+        _check_array_alignment(name, payload, schema, errors)
+        _check_field_constraints(name, payload, schema, errors)
+        _check_interpretation_constraints(name, payload, schema, errors)
+
+
+def _dedupe(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in values:
+        if value and value not in seen:
+            seen.add(value)
+            out.append(value)
+    return out
+
+
+def _bullet_values_after(prompt: str, header_pattern: str) -> list[str]:
+    values: list[str] = []
+    lines = prompt.splitlines()
+    header_re = re.compile(header_pattern, re.IGNORECASE)
+    in_section = False
+    collected = False
+    for line in lines:
+        if not in_section:
+            if header_re.search(line):
+                in_section = True
             continue
-        required = schema.get("required_fields", [])
-        if isinstance(required, list):
-            for field in required:
-                if isinstance(field, str) and field not in artifact:
-                    errors.append(f"{name} missing required field {field}")
-        nested = schema.get("nested_required_fields", {})
-        if isinstance(nested, dict):
-            for field, nested_schema in nested.items():
-                if not isinstance(nested_schema, dict) or field not in artifact:
-                    continue
-                nested_required = nested_schema.get("required_fields", [])
-                if not isinstance(nested_required, list):
-                    continue
-                values = artifact[field]
-                if isinstance(values, list):
-                    for idx, value in enumerate(values):
-                        if not isinstance(value, dict):
-                            errors.append(f"{name}.{field}[{idx}] must be an object")
-                            continue
-                        for nested_field in nested_required:
-                            if isinstance(nested_field, str) and nested_field not in value:
-                                errors.append(
-                                    f"{name}.{field}[{idx}] missing required field {nested_field}"
-                                )
-                elif isinstance(values, dict):
-                    for nested_field in nested_required:
-                        if isinstance(nested_field, str) and nested_field not in values:
-                            errors.append(f"{name}.{field} missing required field {nested_field}")
+        stripped = line.strip()
+        if collected and (not stripped or stripped.startswith("#") or stripped.lower().startswith("for `")):
+            break
+        if not stripped.startswith("-"):
+            continue
+        collected = True
+        ticks = re.findall(r"`([^`]+)`", stripped)
+        if ticks:
+            values.extend(ticks)
+            continue
+        value = stripped.lstrip("-").strip()
+        if value:
+            values.append(value)
+    return values
 
 
-def _check_array_alignment(artifacts: dict[str, Any], errors: list[str]) -> None:
-    spectrum = artifacts.get("diphoton_mass_spectrum.json")
-    if isinstance(spectrum, dict):
-        edges = spectrum.get("bin_edges_gev", spectrum.get("bin_edges"))
-        counts = spectrum.get("bin_counts")
-        uncertainties = spectrum.get("bin_uncertainties")
-        if isinstance(edges, list) and isinstance(counts, list) and len(edges) != len(counts) + 1:
-            errors.append("diphoton_mass_spectrum edges length must equal counts length + 1")
-        if (
-            isinstance(counts, list)
-            and isinstance(uncertainties, list)
-            and len(counts) != len(uncertainties)
-        ):
-            errors.append("diphoton_mass_spectrum counts and uncertainties length mismatch")
-
-    residual = artifacts.get("data_minus_background.json")
-    if isinstance(residual, dict):
-        residual_counts = residual.get("residual_counts")
-        residual_uncertainties = residual.get("residual_uncertainties")
-        edges = residual.get("bin_edges_gev", residual.get("bin_edges"))
-        centers = residual.get("bin_centers")
-        if isinstance(edges, list) and isinstance(residual_counts, list) and len(edges) != len(residual_counts) + 1:
-            errors.append("data_minus_background edges length must equal residual length + 1")
-        if isinstance(centers, list) and isinstance(residual_counts, list) and len(centers) != len(residual_counts):
-            errors.append("data_minus_background centers and residual length mismatch")
-        if (
-            isinstance(residual_counts, list)
-            and isinstance(residual_uncertainties, list)
-            and len(residual_counts) != len(residual_uncertainties)
-        ):
-            errors.append("data_minus_background residual and uncertainty length mismatch")
+def extract_prompt_requirements(prompt: str) -> dict[str, list[str]]:
+    """Extract only explicit, machine-checkable requirements from a public prompt."""
+    stage_ids = re.findall(r'"stage_id"\s*:\s*"([^"]+)"', prompt)
+    cut_ids = re.findall(r'"cut_id"\s*:\s*"([^"]+)"', prompt)
+    stage_ids.extend(
+        _bullet_values_after(prompt, r"workflow_stages.*exact stage ids")
+    )
+    cut_ids.extend(
+        _bullet_values_after(prompt, r"cuts_applied.*exact.*cut_id")
+    )
+    sample_names = _bullet_values_after(prompt, r"sample names exactly")
+    return {
+        "stage_ids": _dedupe(stage_ids),
+        "cut_ids": _dedupe(cut_ids),
+        "sample_names": _dedupe(sample_names),
+    }
 
 
-def _check_peak_consistency(artifacts: dict[str, Any], errors: list[str]) -> None:
-    fit = artifacts.get("diphoton_fit_summary.json")
+def _values_from_object_list(values: Any, *keys: str) -> set[str]:
+    found: set[str] = set()
+    if not isinstance(values, list):
+        return found
+    for item in values:
+        if not isinstance(item, dict):
+            continue
+        for key in keys:
+            value = item.get(key)
+            if isinstance(value, str):
+                found.add(value)
+    return found
+
+
+def _check_trace_output_files(
+    artifacts: dict[str, Any],
+    required: set[str],
+    errors: list[str],
+) -> None:
     trace = artifacts.get("submission_trace.json")
-    if not isinstance(fit, dict) or not isinstance(trace, dict):
+    if not isinstance(trace, dict):
         return
-    fit_peak = _first_number(
-        fit,
-        [
-            "signal_peak_position",
-            "signal_peak_gev",
-            "gaussian_mean_gev",
-            "signal_peak_mass_GeV",
-            "signal_peak_mass_gev",
-        ],
-    )
-    trace_peak = _first_number(
-        trace,
-        [
-            "reported_result.signal_peak_position",
-            "reported_result.signal_peak_gev",
-            "result_summary.signal_peak_gev",
-        ],
-    )
-    if fit_peak is not None and trace_peak is not None and abs(fit_peak - trace_peak) > 1e-6:
+    generated = trace.get("output_files_generated")
+    if generated is None:
+        return
+    if not isinstance(generated, list):
+        errors.append("submission_trace.json.output_files_generated must be a list")
+        return
+    generated_names = {str(item) for item in generated}
+    missing_generated = sorted(required - generated_names)
+    if missing_generated:
         errors.append(
-            f"signal peak mismatch between fit summary ({fit_peak}) and trace ({trace_peak})"
+            f"submission_trace.json.output_files_generated missing required artifact(s): {missing_generated}"
         )
 
 
-def _check_l1(artifacts: dict[str, Any], errors: list[str]) -> None:
+def _check_prompt_requirements(
+    artifacts: dict[str, Any],
+    prompt: str,
+    errors: list[str],
+) -> None:
     trace = artifacts.get("submission_trace.json")
-    fit = artifacts.get("diphoton_fit_summary.json")
     if not isinstance(trace, dict):
-        errors.append("L1 submission_trace.json must be a JSON object")
         return
-
-    for field in ("input_files_used", "input_file_count", "selected_events_total", "cutflow_summary"):
-        if field not in trace:
-            errors.append(f"L1 trace missing {field}")
-
-    input_files = trace.get("input_files_used")
-    input_count = trace.get("input_file_count")
-    if isinstance(input_files, list) and isinstance(input_count, int) and len(input_files) != input_count:
-        errors.append("L1 input_file_count must match len(input_files_used)")
-
-    selected_total = trace.get("selected_events_total")
-    cutflow = trace.get("cutflow_summary")
-    if isinstance(cutflow, dict) and isinstance(selected_total, int):
-        selected_cutflow = cutflow.get("selected_events")
-        if isinstance(selected_cutflow, int) and selected_total != selected_cutflow:
-            errors.append("L1 selected_events_total must match cutflow_summary.selected_events")
-
-    stages = trace.get("workflow_stages")
-    if not isinstance(stages, list):
-        errors.append("L1 workflow_stages must be a list")
-    else:
-        actual = [item.get("stage_id") for item in stages if isinstance(item, dict)]
-        if actual != L1_STAGE_IDS:
-            errors.append(f"L1 workflow_stages must match strict baseline order {L1_STAGE_IDS}")
-
-    cuts = trace.get("cuts_applied")
-    if not isinstance(cuts, list):
-        errors.append("L1 cuts_applied must be a list")
-    else:
-        actual_cuts = {item.get("cut_id") for item in cuts if isinstance(item, dict)}
-        missing = sorted(L1_CUT_IDS - actual_cuts)
+    requirements = extract_prompt_requirements(prompt)
+    if requirements["stage_ids"]:
+        actual = _values_from_object_list(trace.get("workflow_stages"), "stage_id", "stage_label")
+        missing = sorted(set(requirements["stage_ids"]) - actual)
         if missing:
-            errors.append(f"L1 cuts_applied missing baseline cuts: {missing}")
-
-    fit_family = trace.get("fit_model_family_used")
-    if not isinstance(fit_family, dict):
-        errors.append("L1 trace missing fit_model_family_used object")
-    else:
-        if str(fit_family.get("signal", "")).lower() != "gaussian":
-            errors.append("L1 fit_model_family_used.signal must be gaussian")
-        if str(fit_family.get("background", "")).lower() != "polynomial":
-            errors.append("L1 fit_model_family_used.background must be polynomial")
-        if fit_family.get("background_order") != 4:
-            errors.append("L1 fit_model_family_used.background_order must be 4")
-        fit_range = fit_family.get("fit_range_GeV")
-        if fit_range != [100.0, 160.0] and fit_range != [100, 160]:
-            errors.append("L1 fit_model_family_used.fit_range_GeV must be [100.0, 160.0]")
-
-    if isinstance(fit, dict):
-        if str(fit.get("signal_model_family", "")).lower() != "gaussian":
-            errors.append("L1 diphoton_fit_summary signal_model_family must be gaussian")
-        if str(fit.get("background_model_family", "")).lower() != "polynomial":
-            errors.append("L1 diphoton_fit_summary background_model_family must be polynomial")
+            errors.append(f"submission_trace.json.workflow_stages missing prompt-declared stage id(s): {missing}")
+    if requirements["cut_ids"]:
+        actual = _values_from_object_list(trace.get("cuts_applied"), "cut_id")
+        missing = sorted(set(requirements["cut_ids"]) - actual)
+        if missing:
+            errors.append(f"submission_trace.json.cuts_applied missing prompt-declared cut id(s): {missing}")
+    if requirements["sample_names"]:
+        actual = _values_from_object_list(trace.get("input_samples_used"), "sample_name")
+        missing = sorted(set(requirements["sample_names"]) - actual)
+        if missing:
+            errors.append(f"submission_trace.json.input_samples_used missing prompt-declared sample name(s): {missing}")
 
 
-def _check_l2_l3(artifacts: dict[str, Any], errors: list[str], warnings: list[str]) -> None:
-    trace = artifacts.get("submission_trace.json")
+def _walk_values(payload: Any):
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            yield key, value
+            yield from _walk_values(value)
+    elif isinstance(payload, list):
+        for value in payload:
+            yield from _walk_values(value)
+
+
+def _check_scientific_consistency(artifacts: dict[str, Any], warnings: list[str]) -> None:
     interpretation = artifacts.get("interpretation.md")
-    if not isinstance(trace, dict):
-        errors.append("L2/L3 submission_trace.json must be a JSON object")
+    if not isinstance(interpretation, str):
+        return
+    lower_text = interpretation.lower()
+    overclaim_terms = (
+        "discovery",
+        "clear excess",
+        "clear higgs",
+        "observed higgs",
+        "definitive",
+        "significant excess",
+    )
+    if not any(term in lower_text for term in overclaim_terms):
         return
 
-    for field in (
-        "workflow_stages",
-        "data_scope",
-        "scientific_decisions",
-        "observable_constructed",
-        "inference_strategy",
-        "validation_actions",
-        "output_files_generated",
-    ):
-        if field not in trace:
-            errors.append(f"L2/L3 trace missing {field}")
-
-    stages = trace.get("workflow_stages")
-    if isinstance(stages, list):
-        families = {item.get("family") for item in stages if isinstance(item, dict)}
-        missing = sorted(L2_L3_STAGE_FAMILIES - families)
-        if missing:
-            errors.append(f"L2/L3 workflow stage families missing: {missing}")
-
-    fit = artifacts.get("diphoton_fit_summary.json")
-    if isinstance(fit, dict) and isinstance(interpretation, str):
-        peak = _first_number(
-            fit,
-            [
-                "signal_peak_gev",
-                "gaussian_mean_gev",
-                "signal_peak_position",
-                "signal_peak_mass_GeV",
-                "signal_peak_mass_gev",
-            ],
-        )
-        if peak is not None and not (123.0 <= peak <= 127.0):
-            lower_text = interpretation.lower()
-            overclaim_terms = ("discovery", "clear higgs", "observed higgs", "definitive")
-            if any(term in lower_text for term in overclaim_terms):
-                warnings.append(
-                    "interpretation appears to overclaim a Higgs-like result while the peak is outside 123-127 GeV"
-                )
+    for key, value in _walk_values(artifacts):
+        key_lower = str(key).lower()
+        if key_lower in {"excess_observed", "fit_success", "success"} and value is False:
+            warnings.append(
+                f"interpretation may overclaim while {key}=false in the returned artifacts"
+            )
+            return
+        if "significance" in key_lower and _is_number(value) and float(value) < 1.0:
+            warnings.append(
+                f"interpretation may overclaim while {key}={value} is a low significance proxy"
+            )
+            return
 
 
 def _feedback(
@@ -346,11 +457,9 @@ def _feedback(
     if missing:
         retry_parts.append("add every missing required artifact")
     if schema_errors:
-        retry_parts.append("fix JSON/markdown types, required fields, and array alignment")
+        retry_parts.append("fix JSON/markdown types, required fields, field types, constraints, and array alignment")
     if trace_errors:
-        retry_parts.append("fix submission_trace consistency and task-specific trace fields")
-    if warnings:
-        retry_parts.append("make interpretation scientifically cautious and consistent")
+        retry_parts.append("fix submission_trace consistency and prompt-declared exact evidence")
     retry_instruction = (
         "; ".join(retry_parts)
         if retry_parts
@@ -413,28 +522,12 @@ def review_submission_bundle(
             if not isinstance(payload, dict):
                 schema_errors.append(f"{name} must be a JSON object for {art_type} output")
 
-    interpretation = artifacts.get("interpretation.md")
-    if isinstance(interpretation, str):
-        min_chars = (
-            contract.get("schemas", {})
-            .get("interpretation.md", {})
-            .get("constraints", {})
-            .get("min_characters", 1)
-            if isinstance(contract.get("schemas"), dict)
-            else 1
-        )
-        if len(interpretation.strip()) < int(min_chars):
-            schema_errors.append(f"interpretation.md must be at least {min_chars} characters")
+    _check_contract_schemas(artifacts, contract, schema_errors)
+    _check_trace_output_files(artifacts, required, trace_errors)
 
-    _check_required_schema_fields(artifacts, contract, schema_errors)
-    _check_array_alignment(artifacts, schema_errors)
-    _check_peak_consistency(artifacts, trace_errors)
-
-    level = detect_task_level(req_json)
-    if level == "l1":
-        _check_l1(artifacts, trace_errors)
-    elif level in {"l2", "l3"}:
-        _check_l2_l3(artifacts, trace_errors, warnings)
+    prompt = str(req_json.get("prompt") or "") if isinstance(req_json, dict) else ""
+    _check_prompt_requirements(artifacts, prompt, trace_errors)
+    _check_scientific_consistency(artifacts, warnings)
 
     passed = not missing and not schema_errors and not trace_errors
     return ReviewResult(
@@ -442,4 +535,3 @@ def review_submission_bundle(
         feedback=_feedback(missing, schema_errors, trace_errors, warnings),
         bundle=bundle,
     )
-

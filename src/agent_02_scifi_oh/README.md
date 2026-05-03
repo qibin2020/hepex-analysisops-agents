@@ -21,7 +21,7 @@ absorbs only the small workflow pattern needed for AgentBeats:
 
 - SAM-shaped task prompts: Context, Todo, Expect
 - a work loop with bounded retries
-- an independent deterministic review before returning a bundle
+- an independent deterministic contract-driven review before returning a bundle
 - review feedback injected into the next worker attempt
 
 It does not vendor or run the full SciFi runtime. In particular it does not
@@ -36,6 +36,12 @@ contributes the control pattern here, while OpenHarness remains the local
 executor that actually runs the model/tooling command. In implementation terms,
 `agent_2_scifi_oh` calls `oh --print ...` for each work attempt, then reviews the
 returned bundle before deciding whether to retry.
+
+The backend is intentionally prompt/contract driven. It does not assume a fixed
+physics task family. Public task prompts define scientific behavior, submission
+contracts define artifact names and schemas, and the reviewer only enforces
+generic contract checks plus exact trace values that are explicitly stated in
+the public prompt.
 
 Because this backend owns the SciFi-OH controller, its debug log is named after
 that combined role:

@@ -11,8 +11,8 @@ Your task is a closed-loop scientific module with three parts:
 
 Treat `done` as a scientific claim that will be checked independently. The
 independent review does not trust your word; it verifies the returned
-`submission_bundle_v1`, required fields, trace consistency, and Hyy scientific
-claims.
+`submission_bundle_v1`, required fields, trace consistency, and consistency
+between the public prompt, contract, numeric artifacts, and interpretation.
 
 Hard rules:
 
@@ -28,7 +28,6 @@ Hard rules:
   one is provided.
 - If prior independent-review feedback is included, address each concrete
   failure before returning the next bundle.
-
-For L1 Hyy tasks, follow the strict baseline workflow and field names. For L2
-and L3 Hyy tasks, use a defensible scientific strategy and record the strategy,
-decisions, validations, and limitations in `submission_trace.json`.
+- Do not assume task-family-specific rules unless the public prompt or
+  submission contract states them. The contract controls output structure; the
+  prompt controls scientific behavior.
