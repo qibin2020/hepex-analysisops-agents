@@ -26,6 +26,39 @@ SciFi-inspired controller: SAM prompt rendering, independent deterministic
 review, and bounded retry with review feedback. It intentionally does not
 vendor the full SciFi Apptainer/Pam/Cam/SciF runtime.
 
+A native SciFi-style backend without OpenHarness is available as:
+
+```text
+agent_3a_scifi_native
+```
+
+`agent_3a_scifi_native` starts from the same SAM prompt, deterministic review,
+and bounded retry structure as `agent_2_scifi_oh`, but replaces the
+OpenHarness worker subprocess with a small Python-native model/tool loop
+inspired by SciFi's `F/driver.py`.
+
+A more general native backend is also available:
+
+```text
+agent_3b_scifi_native
+```
+
+`agent_3b_scifi_native` uses the same native model/tool loop and independent
+review as `03a`. Its prompt is contract-driven and leaves task-specific
+behavior to the Green task prompt and runtime data.
+
+The SciFi `dev_max_bench_v2` native backend is:
+
+```text
+agent_3c_scifi_native
+```
+
+`agent_3c_scifi_native` keeps the same AgentBeats boundary, but adopts the
+branch-v2 SciFi SAM style: Context/Todo/Expect framing, shared environment
+discovery and activation tools, compacting for long tool outputs, independent
+review, and bounded retry. It still avoids OpenHarness and does not vendor the
+full Apptainer/Pam/Cam scheduler.
+
 ## Repository Role
 
 This repo owns the participant side of the benchmark:
@@ -79,6 +112,24 @@ src/agent_02_scifi_oh/
   - review.py deterministic bundle and Hyy trace review
   - loop.py bounded Prescan -> Work -> Independent Review loop
   - skills/ small text skills for Hyy L1/L2/L3 and bundle review.
+
+src/agent_03a_scifi_native/
+  Backend-owned native SciFi assets for step 03a:
+  - AGENTS.md native worker prompt
+  - native_worker.py OpenAI-compatible model/tool worker loop
+  - no OpenHarness subprocess dependency
+
+src/agent_03b_scifi_native/
+  Backend-owned native SciFi assets for step 03b:
+  - AGENTS.md general native worker prompt
+  - prompt_builder.py task-agnostic SAM prompt renderer
+  - no task-specific deterministic execution shortcut
+
+src/agent_03c_scifi_native/
+  Backend-owned native SciFi assets for step 03c:
+  - AGENTS.md SciFi dev_max_bench_v2-style worker prompt
+  - prompt_builder.py branch-v2 SAM prompt renderer
+  - shared-env and compact-tool guidance
 
 src/bundle_runtime.py
   Request parsing, input manifest loading, deterministic mock bundle helpers
@@ -144,6 +195,18 @@ Registered names today:
 - `oh`
 - `agent_2_scifi_oh`
 - `scifi_oh`
+- `agent_3a_scifi_native`
+- `agent_03a_scifi_native`
+- `scifi_native`
+- `native_scifi`
+- `agent_3b_scifi_native`
+- `agent_03b_scifi_native`
+- `scifi_native_general`
+- `native_scifi_general`
+- `agent_3c_scifi_native`
+- `agent_03c_scifi_native`
+- `scifi_native_v2`
+- `native_scifi_v2`
 
 The `agent_1_oh` backend's prompt and skill assets live under
 `src/agent_01_oh/`. Keep backend-specific assets there so future backends can
@@ -159,6 +222,45 @@ leaderboard runs:
 python3 scripts/local_shared_submit.py \
   --task-id t002_hyy_v5_l1 \
   --solver-backend agent_2_scifi_oh \
+  --max-files 1 \
+  --build-local-images \
+  --no-commit
+```
+
+The `agent_3a_scifi_native` backend's assets live under
+`src/agent_03a_scifi_native/`. Use it when you want the SciFi-style controller
+and worker loop without the OpenHarness dependency:
+
+```bash
+python3 scripts/local_shared_submit.py \
+  --task-id t002_hyy_v5_l1 \
+  --solver-backend agent_3a_scifi_native \
+  --max-files 1 \
+  --build-local-images \
+  --no-commit
+```
+
+The `agent_3b_scifi_native` backend's assets live under
+`src/agent_03b_scifi_native/`. Use it when you want the general native SciFi
+loop without a task-specific deterministic fast path:
+
+```bash
+python3 scripts/local_shared_submit.py \
+  --task-id t002_hyy_v5_l1 \
+  --solver-backend agent_3b_scifi_native \
+  --max-files 1 \
+  --build-local-images \
+  --no-commit
+```
+
+The `agent_3c_scifi_native` backend's assets live under
+`src/agent_03c_scifi_native/`. Use it when you want the native backend aligned
+with SciFi `dev_max_bench_v2`:
+
+```bash
+python3 scripts/local_shared_submit.py \
+  --task-id t002_hyy_v5_l1 \
+  --solver-backend agent_3c_scifi_native \
   --max-files 1 \
   --build-local-images \
   --no-commit

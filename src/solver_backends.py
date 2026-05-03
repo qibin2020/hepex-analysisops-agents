@@ -8,6 +8,9 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol
 
 from agent_02_scifi_oh.loop import SciFiLoop
+from agent_03a_scifi_native.native_worker import NativeSciFiWorker
+from agent_03b_scifi_native.prompt_builder import build_general_sam_prompt
+from agent_03c_scifi_native.prompt_builder import build_v2_sam_prompt
 from bundle_runtime import extract_required_output_names, request_mode
 
 
@@ -194,6 +197,25 @@ def _is_submission_bundle_json(text: str) -> bool:
     return isinstance(payload, dict) and isinstance(payload.get("artifacts"), dict)
 
 
+def _should_recover_submission_bundle(
+    req_json: dict[str, Any] | None,
+    final_text: str,
+) -> bool:
+    try:
+        payload = json.loads(final_text.strip())
+    except Exception:
+        return True
+    if not isinstance(payload, dict):
+        return True
+    artifacts = payload.get("artifacts")
+    if not isinstance(artifacts, dict):
+        return True
+    if payload.get("status") != "ok":
+        return True
+    required_names = set(extract_required_output_names(req_json))
+    return bool(required_names - set(artifacts))
+
+
 def _read_artifact(path: Path) -> Any:
     if path.suffix.lower() == ".md":
         return path.read_text(encoding="utf-8")
@@ -253,6 +275,10 @@ def debug_log_path(work_dir: Path | None = None) -> Path:
 
 def scifi_oh_debug_log_path(work_dir: Path | None = None) -> Path:
     return (work_dir or Path.cwd()) / "debug_scifi_oh_output.log"
+
+
+def scifi_native_debug_log_path(work_dir: Path | None = None) -> Path:
+    return (work_dir or Path.cwd()) / "debug_scifi_native_output.log"
 
 
 def debug_log(blocks: list[tuple[str, str]], work_dir: Path | None = None) -> None:
@@ -637,12 +663,184 @@ class SciFiOhLoopSolverBackend:
         return result.final_text
 
 
+class SciFiNativeSolverBackend:
+    def __init__(
+        self,
+        *,
+        name: str = "agent_3a_scifi_native",
+        prompt_package: str = "agent_03a_scifi_native",
+        prompt_builder: Callable[..., str] | None = None,
+        enable_scifi_v2_tools: bool = False,
+        loop_label: str = "SciFi-OH loop",
+    ) -> None:
+        self.name = name
+        self.prompt_package = prompt_package
+        self.prompt_builder = prompt_builder
+        self.enable_scifi_v2_tools = enable_scifi_v2_tools
+        self.loop_label = loop_label
+
+    def _system_prompt(self) -> str:
+        prompt_path = Path(__file__).resolve().parent / self.prompt_package / "AGENTS.md"
+        try:
+            return prompt_path.read_text(encoding="utf-8").strip()
+        except Exception as exc:
+            logger.warning("Failed to read native SciFi system prompt from %s: %s", prompt_path, exc)
+            return "You are a SciFi-style scientific analysis worker."
+
+    async def run(
+        self,
+        prompt: str,
+        req_json: dict[str, Any] | None,
+        *,
+        system_prompt: str,
+        status: StatusCallback = noop_status,
+        input_manifest: dict[str, Any] | None = None,
+        work_dir: Path | None = None,
+    ) -> str:
+        del system_prompt
+        if work_dir is None:
+            work_dir = resolve_work_dir(req_json)
+        if work_dir is not None:
+            os.environ["HEPEX_SOLVER_WORK_DIR"] = str(work_dir)
+            os.environ["HEPEX_OUTPUT_DIR"] = str(work_dir)
+
+        max_attempts = int(
+            os.environ.get("SCIFI_NATIVE_MAX_RETRIES", os.environ.get("SCIFI_MAX_RETRIES", "2"))
+        )
+        native_system_prompt = self._system_prompt()
+        log_path = scifi_native_debug_log_path(work_dir)
+
+        await status(
+            (
+                f"Solver backend {self.name}: prepared native SciFi controller and worker. "
+                f"{summarize_request(req_json, work_dir)}"
+            )
+        )
+        if input_manifest is not None:
+            await status(summarize_manifest(input_manifest))
+        await status(f"Solver backend {self.name}: debug log: {log_path}")
+
+        async def worker(sam_prompt: str, attempt: int, total_attempts: int) -> str:
+            await status(
+                (
+                    f"Solver backend {self.name}: starting native SciFi worker attempt "
+                    f"{attempt}/{total_attempts}."
+                )
+            )
+            write_debug_log(
+                log_path,
+                [
+                    ("--- Backend ---", self.name),
+                    ("--- Worker Executor ---", "native_scifi"),
+                    ("--- Request Metadata ---", json_dump(req_json or {})),
+                    ("--- SciFi Native Attempt ---", str(attempt)),
+                    ("--- Work Dir ---", str(work_dir or Path.cwd())),
+                    ("--- SAM Prompt ---", sam_prompt),
+                ],
+            )
+
+            native_worker = NativeSciFiWorker(
+                system_prompt=native_system_prompt,
+                req_json=req_json,
+                input_manifest=input_manifest,
+                work_dir=work_dir,
+                status=status,
+                debug_log_path=log_path,
+                enable_scifi_v2_tools=self.enable_scifi_v2_tools,
+            )
+            try:
+                final_text = await native_worker.run(sam_prompt)
+            except Exception as exc:
+                final_text = json_dump(
+                    {
+                        "status": "error",
+                        "error": f"SciFi native worker failed: {type(exc).__name__}: {exc}",
+                    }
+                )
+
+            if _should_recover_submission_bundle(req_json, final_text):
+                recovered_bundle = recover_submission_bundle_from_outputs(req_json, work_dir)
+                if recovered_bundle is not None:
+                    final_text = json_dump(recovered_bundle)
+                    await status(
+                        (
+                            f"Solver backend {self.name}: recovered submission_bundle_v1 "
+                            "from solver output files after non-JSON worker output."
+                        )
+                    )
+
+            write_debug_log(
+                log_path,
+                [
+                    ("--- Backend ---", self.name),
+                    ("--- Worker Executor ---", "native_scifi"),
+                    ("--- SciFi Native Attempt Result ---", str(attempt)),
+                    ("FINAL_TEXT", final_text),
+                ],
+            )
+            await status(summarize_response(final_text))
+            return final_text
+
+        loop_kwargs: dict[str, Any] = {
+            "worker": worker,
+            "status": status,
+            "max_attempts": max_attempts,
+            "label": self.loop_label,
+        }
+        if self.prompt_builder is not None:
+            loop_kwargs["prompt_builder"] = self.prompt_builder
+        loop = SciFiLoop(**loop_kwargs)
+        result = await loop.run(
+            base_prompt=prompt,
+            req_json=req_json,
+            input_manifest=input_manifest,
+            work_dir=work_dir,
+        )
+        await status(
+            (
+                f"Solver backend {self.name}: completed native SciFi loop after "
+                f"{result.attempts} attempt(s); review={result.review.summary}."
+            )
+        )
+        await status(summarize_response(result.final_text))
+        logger.debug("Output from solver backend %s:\n%s", self.name, result.final_text)
+        return result.final_text
+
+
+_SCIFI_NATIVE_03A = SciFiNativeSolverBackend()
+_SCIFI_NATIVE_03B = SciFiNativeSolverBackend(
+    name="agent_3b_scifi_native",
+    prompt_package="agent_03b_scifi_native",
+    prompt_builder=build_general_sam_prompt,
+    loop_label="SciFi-native general loop",
+)
+_SCIFI_NATIVE_03C = SciFiNativeSolverBackend(
+    name="agent_3c_scifi_native",
+    prompt_package="agent_03c_scifi_native",
+    prompt_builder=build_v2_sam_prompt,
+    enable_scifi_v2_tools=True,
+    loop_label="SciFi-native v2 loop",
+)
+
+
 _BACKENDS: dict[str, SolverBackend] = {
     DEFAULT_SOLVER_BACKEND: OpenHarnessSolverBackend(),
     "openharness": OpenHarnessSolverBackend(),
     "oh": OpenHarnessSolverBackend(),
     "agent_2_scifi_oh": SciFiOhLoopSolverBackend(),
     "scifi_oh": SciFiOhLoopSolverBackend(),
+    "agent_3a_scifi_native": _SCIFI_NATIVE_03A,
+    "agent_03a_scifi_native": _SCIFI_NATIVE_03A,
+    "scifi_native": _SCIFI_NATIVE_03A,
+    "native_scifi": _SCIFI_NATIVE_03A,
+    "agent_3b_scifi_native": _SCIFI_NATIVE_03B,
+    "agent_03b_scifi_native": _SCIFI_NATIVE_03B,
+    "scifi_native_general": _SCIFI_NATIVE_03B,
+    "native_scifi_general": _SCIFI_NATIVE_03B,
+    "agent_3c_scifi_native": _SCIFI_NATIVE_03C,
+    "agent_03c_scifi_native": _SCIFI_NATIVE_03C,
+    "scifi_native_v2": _SCIFI_NATIVE_03C,
+    "native_scifi_v2": _SCIFI_NATIVE_03C,
 }
 
 
