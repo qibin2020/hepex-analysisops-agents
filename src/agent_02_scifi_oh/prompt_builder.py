@@ -36,6 +36,88 @@ def _load_skill(name: str) -> str:
         return ""
 
 
+def _should_include_mc_weighting_skill(
+    base_prompt: str,
+    req_json: dict[str, Any] | None,
+    input_manifest: dict[str, Any] | None,
+) -> bool:
+    manifest_files = input_manifest.get("files", []) if isinstance(input_manifest, dict) else []
+    if isinstance(manifest_files, list):
+        for item in manifest_files:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("sample_role") or item.get("role") or "").lower()
+            if item.get("is_mc") is True or role in {"background", "signal", "mc", "simulation", "simulated"}:
+                return True
+
+    text = " ".join(
+        [
+            base_prompt,
+            _json_dump(req_json) if isinstance(req_json, dict) else "",
+            _json_dump(input_manifest) if isinstance(input_manifest, dict) else "",
+        ]
+    ).lower()
+    markers = (
+        "mcweight",
+        "mc weight",
+        "sum_of_weights",
+        "xsec",
+        "filteff",
+        "kfac",
+        "scalefactor",
+        "scale factor",
+        "weighted mc",
+        "mc normalization",
+        "mc normalisation",
+        "monte carlo",
+        "signal template",
+        "signal overlay",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _should_include_vectorized_root_skill(
+    base_prompt: str,
+    req_json: dict[str, Any] | None,
+    input_manifest: dict[str, Any] | None,
+) -> bool:
+    manifest_files = input_manifest.get("files", []) if isinstance(input_manifest, dict) else []
+    if isinstance(manifest_files, list):
+        for item in manifest_files:
+            if not isinstance(item, dict):
+                continue
+            file_format = str(item.get("format") or item.get("file_format") or "").lower()
+            if file_format == "root":
+                return True
+            for key in ("path", "logical_name", "source", "url", "filename"):
+                value = item.get(key)
+                if isinstance(value, str) and value.lower().endswith(".root"):
+                    return True
+
+    text = " ".join(
+        [
+            base_prompt,
+            _json_dump(req_json) if isinstance(req_json, dict) else "",
+            _json_dump(input_manifest) if isinstance(input_manifest, dict) else "",
+        ]
+    ).lower()
+    markers = (
+        "root file",
+        "root files",
+        ".root",
+        "uproot",
+        "awkward",
+        "np.histogram",
+        "numpy histogram",
+        "vectorized",
+        "vectorised",
+        "full sample",
+        "full workflow",
+        "chunked",
+    )
+    return any(marker in text for marker in markers)
+
+
 def _required_output_names(req_json: dict[str, Any] | None) -> list[str]:
     if not isinstance(req_json, dict):
         return []
@@ -121,6 +203,13 @@ def build_sam_prompt(
         _load_skill("evidence_consistency.md"),
         _load_skill("bundle_contract_review.md"),
     ]
+    skill_names = ["contract_driven_analysis", "scientific_trace", "evidence_consistency", "bundle_contract_review"]
+    if _should_include_mc_weighting_skill(base_prompt, req_json, input_manifest):
+        skills.append(_load_skill("mc_weighting.md"))
+        skill_names.append("mc_weighting")
+    if _should_include_vectorized_root_skill(base_prompt, req_json, input_manifest):
+        skills.append(_load_skill("vectorized_root_analysis.md"))
+        skill_names.append("vectorized_root_analysis")
 
     feedback_block = ""
     if review_feedback:
@@ -146,7 +235,7 @@ def build_sam_prompt(
         [
             "---",
             "Rank: 2",
-            "Skills: contract_driven_analysis, scientific_trace, evidence_consistency, bundle_contract_review",
+            f"Skills: {', '.join(skill_names)}",
             "---",
             "",
             f"# AgentBeats HEPEx {task_level.upper()} Submission Bundle",

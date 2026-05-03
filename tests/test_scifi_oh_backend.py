@@ -125,6 +125,25 @@ def _manifest(tmp_path: Path) -> dict:
     return manifest
 
 
+def _mc_manifest(tmp_path: Path) -> dict:
+    root_file = tmp_path / "mc.root"
+    root_file.write_text("placeholder", encoding="utf-8")
+    return {
+        "shared_input_dir": str(tmp_path),
+        "files": [
+            {
+                "logical_name": "mc.root",
+                "path": str(root_file),
+                "size_bytes": root_file.stat().st_size,
+                "sample_role": "background",
+                "is_mc": True,
+                "weight_policy": "weighted",
+            }
+        ],
+        "read_only_for_solver": True,
+    }
+
+
 def _valid_l1_artifacts() -> dict:
     output_names = [
         "diphoton_mass_spectrum.json",
@@ -519,6 +538,7 @@ def test_scifi_prompt_builder_renders_sam_sections(tmp_path):
     assert "Scientific Trace Skill" in prompt
     assert "Evidence Consistency Skill" in prompt
     assert "Hyy L1 Strict Skill" not in prompt
+    assert "MC Weighting Skill" not in prompt
 
 
 def test_scifi_prompt_builder_is_contract_driven_for_hzz_l1(tmp_path):
@@ -535,6 +555,83 @@ def test_scifi_prompt_builder_is_contract_driven_for_hzz_l1(tmp_path):
     assert "contract_driven_analysis" in prompt
     assert "Hyy L1 Strict Skill" not in prompt
     assert "requested analysis" in prompt
+
+
+def test_scifi_prompt_builder_injects_mc_weighting_skill_for_mc_manifest(tmp_path):
+    req = _hzz_l2_request(tmp_path)
+    prompt = build_sam_prompt(
+        "Compare Data to weighted MC backgrounds and signal.",
+        req,
+        _mc_manifest(tmp_path),
+        attempt=1,
+        max_attempts=2,
+    )
+
+    assert "mc_weighting" in prompt
+    assert "MC Weighting Skill" in prompt
+    assert "sum_of_weights" in prompt
+    assert "lumi_fb_inv * 1000" in prompt
+    assert "Data events must remain unweighted" in prompt
+    assert "sqrt(sum(w^2))" in prompt
+    assert "vectorized_root_analysis" in prompt
+    assert "Vectorized ROOT Analysis Skill" in prompt
+    assert "uproot.iterate" in prompt
+    assert "awkward" in prompt
+    assert "np.histogram" in prompt
+    assert "for i in range(len(events))" in prompt
+
+
+def test_scifi_prompt_builder_injects_vectorized_root_skill_for_root_manifest(tmp_path):
+    req = _zpeak_request(tmp_path)
+    prompt = build_sam_prompt(
+        "Fit a peak in observed data.",
+        req,
+        _manifest(tmp_path),
+        attempt=1,
+        max_attempts=2,
+    )
+
+    assert "vectorized_root_analysis" in prompt
+    assert "Vectorized ROOT Analysis Skill" in prompt
+    assert "uproot.iterate" in prompt
+    assert "awkward" in prompt
+    assert "np.histogram" in prompt
+    assert "vector" in prompt
+
+
+def test_scifi_prompt_builder_does_not_inject_vectorized_root_skill_for_non_root_manifest(tmp_path):
+    req = _zpeak_request(tmp_path)
+    csv_file = tmp_path / "events.csv"
+    csv_file.write_text("mass\n91.2\n", encoding="utf-8")
+    manifest = {
+        "shared_input_dir": str(tmp_path),
+        "files": [{"logical_name": "events.csv", "path": str(csv_file), "format": "csv"}],
+        "read_only_for_solver": True,
+    }
+    prompt = build_sam_prompt(
+        "Fit a peak in observed tabular data.",
+        req,
+        manifest,
+        attempt=1,
+        max_attempts=2,
+    )
+
+    assert "Vectorized ROOT Analysis Skill" not in prompt
+    assert "vectorized_root_analysis" not in prompt
+
+
+def test_scifi_prompt_builder_does_not_inject_mc_weighting_skill_for_data_only_manifest(tmp_path):
+    req = _zpeak_request(tmp_path)
+    prompt = build_sam_prompt(
+        "Fit a peak in observed data.",
+        req,
+        _manifest(tmp_path),
+        attempt=1,
+        max_attempts=2,
+    )
+
+    assert "MC Weighting Skill" not in prompt
+    assert "mc_weighting" not in prompt
 
 
 def test_prompt_requirement_extraction_reads_exact_public_lists():
